@@ -1,0 +1,9 @@
+numpy
+pandas
+pyarrow
+scipy
+astropy
+astroquery
+matplotlib
+google-cloud-bigquery
+db-dtypes

@@ -1,0 +1,13 @@
+# Data products and cached query results (large, and contain unpublished survey data)
+*.parquet
+*.csv
+!requirements.txt
+nova_candidates.html
+*.fits
+*.part*
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.DS_Store
