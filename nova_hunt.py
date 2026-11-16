@@ -44,19 +44,35 @@ CFG = dict(
     quiet_days=30.0,         # must be undetected this long before first detection
     min_decline_mag=0.5,     # must fade at least this much after peak
     max_duration_days=200.0, # detected over longer -> variable / AGN
-    min_nights=2,            # use --min-nights 1 to also allow single-night sources
+    min_nights=2,            # multi-night sources: at least this many nights
+    single_night=True,       # also keep single-night sources with independent confirmation:
+    single_min_det=4,        #   >= this many detections that night,
+    single_frac_min=0.5,     #   detected in >= this fraction of exposures,
+                             #   and seen by >= 2 telescopes OR in >= 2 filters;
+    pair_min_det=2,          # ... OR 2-3 detections that are all high-RB and persist:
+    pair_min_rb=0.7,         #   every detection CLASS_REAL >= this,
+    pair_min_span_h=0.5,     #   first-to-last detection >= this many hours (junk pairs are
+                             #   back-to-back exposures minutes apart; cf. AT 2024pid, 1.25 h)
+    single_group_n=3,        # drop single-night candidates if >= this many share host + night
     fade_or_within_days=30., # must fade >= min_decline_mag, OR all detections within this window
     ref_arcsec=1.5,          # a reference-image source this close ...
     ref_brighter_by=1.0,     # ... and brighter than peak+this -> quiescent counterpart = variable
     tns_arcsec=3.0,          # TNS crossmatch radius
     nucleus_arcsec=2.0,      # reject sources this close to the galaxy centre
-    gaia_star_arcsec=1.5,    # reject sources this close to a Gaia star
+    gaia_coincident_arcsec=0.5,  # Gaia source this close = the transient's own star -> reject
+    gaia_star_arcsec=1.5,    # Gaia source within this distance -> reject ...
+    gaia_brighter_by=1.0,    # ... only if brighter than peak + this. Faint Gaia sources 0.5-1.5"
+                             #     away in nearby galaxies are clusters/blends (cf. AT 2025andm,
+                             #     a nova in NGC 55 0.9" from a G=21 source).
     # (G brighter than, within arcsec) pairs for a bright-star cut. OFF by default: BG's "bright"
     # Gaia stars are G<~14, and real novae in Cen A sit 17-90" from G 11-13 stars, so any useful
     # radius also removes real transients. Artefact groups are handled by the cluster flag instead.
     bright_star=[],
     cluster_arcsec=90.0,     # >= cluster_n other candidates this close -> likely artefact group
     cluster_n=3,
+    allow_empty_strips=False,
+    name_lookup=True,        # look up readable names of candidate host galaxies (NED/SIMBAD), cached  # accept REGALADE RA strips that come back empty (normally a VizieR error)
+    score_uses_host=False,   # False: rank on light-curve quality only (host prior shown separately)
     link_arcsec=2.0,         # detections closer than this = same source
     fov_radius_deg=0.9,      # BG/ML half-diagonal, for the image-depth query
 )
@@ -115,28 +131,40 @@ def _download_strips(server, cat_id, cache):
                         _pick(cols, "PA"), c_d, _pick(cols, "logM", "logMstar")] if c]
     table_id = tab.meta.get("name", cat_id)
     print(f"  table {table_id}; filtering {c_d} in {CFG['dmin_mpc']}..{CFG['dmax_mpc']}, {c_de} < {CFG['dec_max']}")
-    parts = []
+    parts, empty = [], []
     for k, ra0 in enumerate(range(0, 360, 15)):
         part = f"{cache}.part{k:02d}.csv"
         if os.path.exists(part):
             parts.append(pd.read_csv(part)); continue
         filt = {c_d: f"{CFG['dmin_mpc']}..{CFG['dmax_mpc']}",
                 c_ra: f"{ra0}..{ra0 + 15}", c_de: f"<{CFG['dec_max']}"}
+        df = None
         for attempt in range(3):
             try:
                 v = Vizier(columns=want, column_filters=filt, row_limit=-1,
                            vizier_server=server, timeout=300)
                 res = v.query_constraints(catalog=table_id)
-                df = res[0].to_pandas() if len(res) else pd.DataFrame(columns=want)
-                break
+                if len(res) and len(res[0]):
+                    df = res[0].to_pandas()
+                    break
+                # VizieR sometimes answers a failed/timed-out query with an EMPTY result
+                # instead of an error, so an empty strip is retried, never trusted at once
+                print(f"    RA {ra0}-{ra0 + 15}: attempt {attempt + 1} returned 0 rows, retrying")
             except Exception as e:
                 print(f"    RA {ra0}-{ra0 + 15}: attempt {attempt + 1} failed ({type(e).__name__})")
-                time.sleep(5)
-        else:
-            raise RuntimeError(f"RA strip {ra0}-{ra0 + 15} failed 3 times (rerun to resume)")
+            time.sleep(5 * (attempt + 1))
+        if df is None:
+            empty.append(f"{ra0}-{ra0 + 15}")
+            print(f"    RA {ra0:3d}-{ra0 + 15:3d}: EMPTY after 3 attempts (not saved; rerun retries it)")
+            continue
         df.to_csv(part, index=False)
         parts.append(df)
         print(f"    RA {ra0:3d}-{ra0 + 15:3d}: {len(df)} galaxies")
+    if empty and not CFG["allow_empty_strips"]:
+        raise SystemExit(
+            f"\nRA strips {', '.join(empty)} came back empty. That is almost always a VizieR hiccup, "
+            "not a real gap.\nRerun the same command to retry them (finished strips are kept). If you are "
+            "sure they are empty, add --allow-empty-strips.")
     t = pd.concat(parts, ignore_index=True)
     t = t.rename(columns={c_ra: "ra", c_de: "dec", c_d: "D"})
     t = t.drop_duplicates(subset=["ra", "dec"]).reset_index(drop=True)
@@ -150,6 +178,76 @@ def _download_strips(server, cat_id, cache):
     return t
 
 
+TAP_URLS = ["https://tapvizier.cds.unistra.fr/TAPVizieR/tap/sync"]
+TAP_TABLE = "J/A+A/706/A284/regalade"
+
+
+def _tap(url, adql, timeout=600):
+    import requests, io
+    r = requests.get(url, params=dict(REQUEST="doQuery", LANG="ADQL", FORMAT="csv",
+                                      MAXREC=5000000, QUERY=adql), timeout=timeout)
+    if r.status_code != 200 or r.text.lstrip().startswith("<"):   # errors come back as VOTable/XML
+        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:300]}")
+    return pd.read_csv(io.StringIO(r.text))
+
+
+def fetch_regalade_tap(cache):
+    """One ADQL query to CDS TAPVizieR with the distance/Dec cuts applied on the server."""
+    for url in TAP_URLS:
+        print(f"Trying TAP {url} ...")
+        try:
+            head = _tap(url, f'SELECT TOP 1 * FROM "{TAP_TABLE}"', timeout=120)
+            cols = list(head.columns)
+            c_ra, c_de = _pick(cols, "RAJ2000", "RA_ICRS", "ra"), _pick(cols, "DEJ2000", "DE_ICRS", "dec")
+            c_d = _pick(cols, "Dist", "D", "Dmpc")
+            if not (c_ra and c_de and c_d):
+                raise RuntimeError(f"could not identify ra/dec/D columns in {cols}")
+            want = [c for c in [_pick(cols, "Name", "name"), c_ra, c_de, _pick(cols, "R1"), _pick(cols, "R2"),
+                                _pick(cols, "PA"), c_d, _pick(cols, "logM", "logMstar")] if c]
+            q = (f'SELECT {", ".join(chr(34) + c + chr(34) for c in want)} FROM "{TAP_TABLE}" '
+                 f'WHERE "{c_d}" > {CFG["dmin_mpc"]} AND "{c_d}" < {CFG["dmax_mpc"]} '
+                 f'AND "{c_de}" < {CFG["dec_max"]}')
+            t = _tap(url, q)
+            if t.empty:
+                raise RuntimeError("query returned 0 rows")
+            t = t.rename(columns={c_ra: "ra", c_de: "dec", c_d: "D"})
+            t = t.drop_duplicates(subset=["ra", "dec"]).reset_index(drop=True)
+            check_against_smaller_caches(t)
+            t.to_csv(cache, index=False)
+            print(f"  {len(t)} galaxies saved to {cache}")
+            return t
+        except SystemExit:
+            raise
+        except Exception as e:
+            print(f"  failed: {type(e).__name__}: {str(e)[:200]}")
+    return None
+
+
+def check_against_smaller_caches(t):
+    """A galaxy list to D Mpc must contain every galaxy of any cached list to d < D Mpc.
+    Catches incomplete downloads (e.g. strips VizieR silently returned empty)."""
+    import glob, re
+    ra = t["ra"].values if "ra" in t else t["RAJ2000"].values
+    de = t["dec"].values if "dec" in t else t["DEJ2000"].values
+    for f in glob.glob("regalade_D*Mpc.csv"):
+        m = re.match(r"regalade_D([\d.]+)Mpc\.csv", f)
+        if not m or float(m.group(1)) >= CFG["dmax_mpc"]:
+            continue
+        s = pd.read_csv(f)
+        s = s.rename(columns={"RAJ2000": "ra", "DEJ2000": "dec"})
+        s = s[s.dec < CFG["dec_max"]]
+        miss = 0
+        for a, d in zip(s.ra.values, s.dec.values):
+            sep = np.hypot((ra - a) * np.cos(np.radians(d)), de - d)
+            miss += not (sep < 0.01).any()
+        if miss:
+            raise SystemExit(
+                f"\nThe {CFG['dmax_mpc']:g} Mpc galaxy list is missing {miss} of the {len(s)} galaxies in {f}, "
+                "so the download is incomplete.\nDelete " + regalade_cache() + " (and any "
+                f"nova_hunt_*_D{CFG['dmax_mpc']:g}_* files made from it) and rerun.")
+        print(f"  check: contains all {len(s)} galaxies of {f}")
+
+
 def fetch_regalade_vizier():
     """Pull only the nearby southern galaxies from VizieR (server-side cut), trying
     several mirrors with a short timeout. Result is cached per distance limit (regalade_D<dmax>Mpc.csv)."""
@@ -157,7 +255,13 @@ def fetch_regalade_vizier():
     cache = regalade_cache()
     if os.path.exists(cache):
         print(f"Using cached {cache} (delete it to re-download)")
-        return pd.read_csv(cache)
+        t = pd.read_csv(cache)
+        check_against_smaller_caches(t)
+        return t
+    t = fetch_regalade_tap(cache)
+    if t is not None:
+        return t
+    print("TAP failed; falling back to the VizieR mirrors")
     from astroquery.vizier import Vizier
     errors = []
     for server in VIZIER_MIRRORS:
@@ -167,13 +271,16 @@ def fetch_regalade_vizier():
             cat_id = REGALADE_VIZIER_ID
             try:
                 Vizier(row_limit=1, **kw).get_catalogs(cat_id)[0]
-            except Exception:
+            except Exception as e0:
+                print(f"  direct lookup of {cat_id} failed ({type(e0).__name__}: {str(e0)[:100]})")
                 cats = Vizier(**kw).find_catalogs("REGALADE")
-                if not cats:
+                ids = [k for k in (cats or {}) if k]
+                if not ids:
                     raise RuntimeError("REGALADE not listed on this mirror")
-                cat_id = list(cats.keys())[0]
+                cat_id = ids[0]
             print("  found catalogue", cat_id)
             t = _download_strips(server, cat_id, cache)
+            check_against_smaller_caches(t)
             return t
         except Exception as e:
             errors.append(f"{server}: {type(e).__name__}: {str(e)[:120]}")
@@ -181,27 +288,86 @@ def fetch_regalade_vizier():
     raise SystemExit(
         "\nCould not get REGALADE from any VizieR mirror:\n  " + "\n  ".join(errors) +
         "\n\nOptions:\n"
-        "  1. Download it by hand (browser/VPN), e.g. from CDS 'J/A+A/706/A284', or ask the\n"
-        "     BlackGEM team (Hugo Tranin / blackpearl.blackgem.org) for the D<20 Mpc subset,\n"
-        "     then run:  python nova_hunt.py --regalade that_file.fits\n"
+        "  1. Download REGALADE v2 once from the Google Drive link in the README of\n"
+        "     github.com/htranin/ellipse_xmatch (4 GB FITS), then run:\n"
+        "         python nova_hunt.py --dmax <D> --regalade /path/to/that_file.fits\n"
+        "     The galaxies within <D> Mpc are saved, so later runs need neither the file nor VizieR.\n"
         "  2. Check whether your network blocks VizieR:  curl -I https://vizier.cfa.harvard.edu\n")
+
+
+ALIASES = {"raj2000": "ra", "dej2000": "dec", "ra_icrs": "ra", "de_icrs": "dec", "de": "dec",
+           "gal_ra": "ra", "gal_dec": "dec", "ra": "ra", "dec": "dec",
+           "d": "D", "dist": "D", "dist_mpc": "D", "d_mpc": "D", "distance": "D", "gal_dist": "D",
+           "r1": "R1", "r2": "R2", "pa": "PA",
+           "logm": "logM", "logmstar": "logM", "logm_star": "logM", "lgmstar": "logM",
+           "name": "name", "gal_name": "name", "objname": "name", "galname": "name",
+           "pgc": "pgc", "pgc_id": "pgc", "leda": "pgc", "hyperleda": "pgc"}
+
+
+def read_regalade_file(path):
+    """Read a local REGALADE file (e.g. the 4 GB FITS linked from github.com/htranin/ellipse_xmatch)
+    without loading it whole: only the needed columns, only rows with dmin < D < dmax and
+    Dec < dec_max. The subset is saved as regalade_D<dmax>Mpc.csv, so later runs need neither
+    the big file nor VizieR."""
+    want_std = ["name", "pgc", "ra", "dec", "R1", "R2", "PA", "D", "logM"]
+    def mapping(cols):
+        m = {}
+        for c in cols:
+            std = ALIASES.get(c.lower())
+            if std and std not in m.values():
+                m[c] = std
+        return m
+    if path.endswith((".fits", ".fit", ".fits.gz")):
+        from astropy.io import fits
+        with fits.open(path, memmap=True) as h:
+            hdu = next(x for x in h if isinstance(x, fits.BinTableHDU))
+            cols = hdu.columns.names
+            m = mapping(cols)
+            inv = {v: k for k, v in m.items()}
+            print(f"  {path}: {hdu.header.get('NAXIS2', '?')} rows; using columns {m}")
+            if not {"ra", "dec", "D"} <= set(inv):
+                raise SystemExit(f"Cannot find ra/dec/distance columns in {path}; columns are {cols}")
+            data = hdu.data
+            d = np.asarray(data[inv["D"]], float)
+            de = np.asarray(data[inv["dec"]], float)
+            sel = np.flatnonzero((d > CFG["dmin_mpc"]) & (d < CFG["dmax_mpc"]) & (de < CFG["dec_max"]))
+            def native(x):                       # FITS is big-endian; pandas needs native order
+                x = np.asarray(x)
+                return x.astype(x.dtype.newbyteorder("=")) if x.dtype.kind in "fiub" else x
+            g = pd.DataFrame({std: native(data[inv[std]][sel]) for std in want_std if std in inv})
+    elif path.endswith(".parquet"):
+        import pyarrow.parquet as pq
+        cols = pq.ParquetFile(path).schema.names
+        m = mapping(cols)
+        inv = {v: k for k, v in m.items()}
+        g = pd.read_parquet(path, columns=list(m),
+                            filters=[(inv["D"], ">", CFG["dmin_mpc"]), (inv["D"], "<", CFG["dmax_mpc"]),
+                                     (inv["dec"], "<", CFG["dec_max"])]).rename(columns=m)
+    else:
+        parts = []
+        for chunk in pd.read_csv(path, chunksize=2_000_000):
+            m = mapping(chunk.columns)
+            chunk = chunk[list(m)].rename(columns=m)
+            parts.append(chunk[(chunk.D > CFG["dmin_mpc"]) & (chunk.D < CFG["dmax_mpc"])
+                               & (chunk.dec < CFG["dec_max"])])
+        g = pd.concat(parts, ignore_index=True)
+    for c in g.columns:
+        if g[c].dtype == object:
+            g[c] = g[c].apply(lambda v: v.decode() if isinstance(v, bytes) else v)
+    g = g.drop_duplicates(subset=["ra", "dec"]).reset_index(drop=True)
+    check_against_smaller_caches(g)
+    g.to_csv(regalade_cache(), index=False)
+    print(f"  {len(g)} galaxies saved to {regalade_cache()} (later runs can omit --regalade)")
+    return g
 
 
 def load_galaxies(path=None):
     if path is None:
         g = fetch_regalade_vizier()
-    elif path.endswith(".parquet"):
-        g = pd.read_parquet(path)
-    elif path.endswith((".fits", ".fit", ".fits.gz")):
-        from astropy.table import Table
-        g = Table.read(path).to_pandas()
     else:
-        g = pd.read_csv(path)
+        g = read_regalade_file(path)
     # normalise column names (VizieR / local files may differ in case or naming)
-    alias = {"raj2000": "ra", "dej2000": "dec", "ra_icrs": "ra", "de_icrs": "dec", "de": "dec",
-             "d": "D", "dist": "D", "r1": "R1", "r2": "R2", "pa": "PA",
-             "logm": "logM", "logmstar": "logM", "name": "name"}
-    g = g.rename(columns={c: alias[c.lower()] for c in g.columns if c.lower() in alias})
+    g = g.rename(columns={c: ALIASES[c.lower()] for c in g.columns if c.lower() in ALIASES})
     missing = [c for c in ["ra", "dec", "D"] if c not in g]
     if missing:
         raise SystemExit(f"REGALADE table lacks columns {missing}; columns are: {list(g.columns)}")
@@ -218,10 +384,26 @@ def load_galaxies(path=None):
     g["dm"] = 5 * np.log10(g.D * 1e6) - 5
     # relative nova yield: ~ stellar mass x fraction of nova LF above the depth
     g["priority"] = 10 ** (g.logM - 10) * np.clip((CFG["m_lim"] - g.dm + 10.5) / 6, 0, 1)
-    g["name"] = g["name"].astype(str)
+    g = fill_names(g)
     g = g.sort_values(["priority", "name", "ra"], ascending=[False, True, True],
                       kind="mergesort").reset_index(drop=True)   # deterministic order
     g["gid"] = np.arange(len(g))
+    return g
+
+
+def fill_names(g):
+    """Galaxies without a name (REGALADE v2 'thin' has no name column) get 'PGC <n>' if a PGC
+    column exists, else a name from their coordinates, so nothing keys on an empty string.
+    Real names for candidate hosts are added later by name_hosts()."""
+    g = g.copy()
+    n = g["name"].astype(str).str.strip()
+    if "pgc" in g:
+        pg = pd.to_numeric(g["pgc"], errors="coerce")
+        n = np.where(n.isin(["", "nan", "None", "NaN"]) & pg.notna() & (pg > 0),
+                     ["PGC" + str(int(p)) if p == p else "" for p in pg], n)
+        n = pd.Series(n, index=g.index)
+    blank = n.isin(["", "nan", "None", "NaN"])
+    g["name"] = np.where(blank, [f"J{r:08.4f}{d:+08.4f}" for r, d in zip(g.ra, g.dec)], n)
     return g
 
 
@@ -297,6 +479,17 @@ def fetch_images(F, project, cache, chunk=3000):
     Queried in chunks so the inline array stays under BigQuery's query-length limit."""
     import os
     have = pd.read_parquet(cache) if os.path.exists(cache) else None
+    if have is not None:
+        # cached rows are keyed by source number; keep only those whose stored position still
+        # matches the current source (numbering changes if the grouping or data change)
+        if {"q_ra", "q_dec"} <= set(have.columns):
+            cur = F[["ra", "dec"]].reindex(have.src.values)
+            ok = ((((cur.ra.values - have.q_ra.values + 180) % 360 - 180)
+                   * np.cos(np.radians(have.q_dec.values))) ** 2
+                  + (cur.dec.values - have.q_dec.values) ** 2) < (1.0 / 3600) ** 2
+            have = have[ok]
+        else:
+            have = None                                  # old cache without positions: rebuild
     done = set(have.src.unique()) if have is not None else set()
     todo = F[~F.index.isin(done)]
     parts = [have] if have is not None else []
@@ -304,6 +497,7 @@ def fetch_images(F, project, cache, chunk=3000):
         print(f"  image query {k // chunk + 1}/{(len(todo) - 1) // chunk + 1} ({len(todo[k:k + chunk])} sources)")
         res = run_query(images_query(todo.iloc[k:k + chunk]), project)
         if res is not None:
+            res = res.join(F[["ra", "dec"]].rename(columns={"ra": "q_ra", "dec": "q_dec"}), on="src")
             parts.append(res)
     if not parts:
         return None
@@ -311,7 +505,10 @@ def fetch_images(F, project, cache, chunk=3000):
     # record queried sources with no images too, so they are not re-queried
     empty = set(todo.index) - set(images.src.unique())
     if empty:
-        images = pd.concat([images, pd.DataFrame({"src": list(empty)})], ignore_index=True)
+        images = pd.concat([images, pd.DataFrame({"src": list(empty),
+                                                  "q_ra": F.loc[list(empty), "ra"].values,
+                                                  "q_dec": F.loc[list(empty), "dec"].values})],
+                           ignore_index=True)
     images.to_parquet(cache)
     images = images.dropna(subset=["mjd"])
     # keep only images whose (square) footprint really contains the source
@@ -409,17 +606,23 @@ def nova_features(lc):
     good = lc[np.isfinite(lc.mag)]
     if good.empty:
         return None
+    conf = good[good.rb >= CFG["rb_min"]]          # peak/fade from confident detections if any:
+    if len(conf):                                    # a stray low-RB detection must not set M_peak
+        good = conf
     peak = good.loc[good.mag.idxmin()]
     after = good[good.mjd > peak.mjd + 0.5]
     f = dict(
         ra=lc.ra.median(), dec=lc.dec.median(), n_det=len(lc),
         n_nights=lc.mjd.round().nunique(), telescopes=",".join(sorted(lc.telescop.dropna().unique())),
+        n_tel=lc.telescop.nunique(), n_filt=lc.filt.nunique(),
+        rb_min=lc.rb.min(), span_h=(lc.mjd.max() - lc.mjd.min()) * 24,
         first_mjd=lc.mjd.min(), last_mjd=lc.mjd.max(),
         peak_mag=peak.mag, peak_filt=peak.filt, peak_mjd=peak.mjd,
         M_peak=peak.mag - lc.host_dm.iloc[0],
         decline=(after.mag.max() - peak.mag) if len(after) else np.nan,
         rb_med=lc.rb.median(), rb_mean=lc.rb.mean(),
-        host=lc.host_name.iloc[0], host_D=lc.host_D.iloc[0], host_logM=lc.host_logM.iloc[0],
+        host=lc.host_name.iloc[0], host_gid=int(lc.gid.iloc[0]),
+        host_D=lc.host_D.iloc[0], host_logM=lc.host_logM.iloc[0],
         host_priority=lc.host_priority.iloc[0], r_ell=lc.r_ell.min(), r_nuc=lc.r_nuc.median(),
         sep_gaia=lc.sep_near_gaia.median(), gaia_g=lc.mag_g_near_gaia.median(),
         sep_ref=lc.sep_near_ref.median(), ref_mag=lc.mag_auto_near_ref.median(),
@@ -441,10 +644,17 @@ def apply_cuts(F):
     c["off_nucleus"] = F.r_nuc > CFG["nucleus_arcsec"]
     c["n_det"] = F.n_det >= CFG["min_det"]
     c["mean_rb"] = F.rb_mean > CFG["rb_min"]
-    c["nights"] = F.n_nights >= CFG["min_nights"]
+    single_ok = (CFG["single_night"] & (F.n_nights == 1) & (F.n_det >= CFG["single_min_det"])
+                 & ((F.n_tel >= 2) | (F.n_filt >= 2)))
+    pair_ok = (CFG["single_night"] & (F.n_nights == 1) & (F.n_det >= CFG["pair_min_det"])
+               & (F.rb_min >= CFG["pair_min_rb"]) & (F.span_h >= CFG["pair_min_span_h"]))
+    single_ok = single_ok | pair_ok
+    c["nights"] = (F.n_nights >= CFG["min_nights"]) | single_ok
     c["duration"] = dur < CFG["max_duration_days"]
     c["fades"] = (F.decline >= CFG["min_decline_mag"]) | (dur < CFG["fade_or_within_days"])
-    c["no_gaia_star"] = ~(F.sep_gaia < CFG["gaia_star_arcsec"])
+    c["no_gaia_star"] = ~((F.sep_gaia < CFG["gaia_coincident_arcsec"])
+                          | ((F.sep_gaia < CFG["gaia_star_arcsec"])
+                             & ~(F.gaia_g > F.peak_mag + CFG["gaia_brighter_by"])))
     c["no_ref_counterpart"] = ~((F.sep_ref < CFG["ref_arcsec"])
                                 & (F.ref_mag < F.peak_mag + CFG["ref_brighter_by"]))
     near_bright = np.zeros(len(F), bool)
@@ -456,12 +666,25 @@ def apply_cuts(F):
     for col in c:
         keep &= c[col].values
         print(f"  {col:<20s}{keep.sum():>8d}")
+    # bad-epoch groups: several single-night candidates in one galaxy on the same night
+    night0 = np.floor(F.first_mjd - 0.5)
+    single = keep & (F.n_nights == 1).values
+    # grouped by the host's unique id, never its name (names can be blank or shared)
+    grp = pd.Series(1, index=F.index)[single].groupby([F.host_gid[single], night0[single]]).transform("size")
+    bad = pd.Series(False, index=F.index)
+    bad[grp.index] = grp.values >= CFG["single_group_n"]
+    keep &= ~bad.values
+    print(f"  {'single_night_groups':<20s}{keep.sum():>8d}")
     s = np.ones(len(F))
     s *= np.where(F.decline >= CFG["min_decline_mag"], 1.0, 0.6)
     s *= np.where(F.t2_days.between(2, 150), 1.5, 1.0)
     s *= np.clip(F.n_nights / 4, 0.5, 1.0)
     s *= np.clip((F.rb_med - 0.4) / 0.5, 0.2, 1.0)
-    s *= np.clip(F.host_priority / F.host_priority.max(), 0.05, 1) ** 0.3
+    # host prior (expected nova yield of the host, 0-1) is kept as its own column; it only
+    # enters the ranking if CFG["score_uses_host"] is set (--rank-by-host)
+    F["host_prior"] = np.clip(F.host_priority / F.host_priority.max(), 0.05, 1) ** 0.3
+    if CFG["score_uses_host"]:
+        s *= F["host_prior"].values
     F["score"] = s
     return F[keep].sort_values("score", ascending=False)
 
@@ -492,8 +715,9 @@ def flag_tns(F, path):
 
 # ---------------------------------------------------------------- 5. quiet-before check
 def add_quiet_flag(F, images):
-    """quiet=True if a good image >= quiet_days before the first detection was deep enough
-    to have seen the source at (peak - 0.5 mag) and it wasn't detected."""
+    """quiet=True if a good (green/yellow) image taken 1-365 days before the first detection
+    reached at least 0.5 mag fainter than the peak, i.e. the source would have been seen
+    there had it already been bright, and it was not detected."""
     F = F.copy()
     F["quiet"] = pd.Series([None] * len(F), index=F.index, dtype=object)
     F["n_pre_images"] = 0
@@ -513,6 +737,101 @@ def add_quiet_flag(F, images):
 
 
 # ---------------------------------------------------------------- 6. inspection page
+NAMES_FILE = "galaxy_names.csv"
+COMMON = {"PGC2789": "NGC 253", "PGC1014": "NGC 55", "PGC2758": "NGC 247", "PGC000143": "WLM",
+          "PGC143": "WLM", "NGC5128": "Cen A", "NGC5236": "M83"}
+
+
+def _lookup_name(ra, dec, radius_arcsec):
+    """Name of the galaxy at (ra, dec). Returns (name, source, status) with status 'ok',
+    'none' (a service answered: no galaxy there) or 'error' (no service answered)."""
+    import time
+    c = SkyCoord(ra * u.deg, dec * u.deg)
+    answered = False
+    rank = {"G": 0, "GPair": 1, "GTrpl": 1, "GGroup": 2}
+    for attempt in range(3):                       # NED rate-limits bursts: back off and retry
+        try:
+            from astroquery.ipac.ned import Ned
+            t = Ned.query_region(c, radius=radius_arcsec * u.arcsec)
+            answered = True
+            if t is not None and len(t):
+                t = t.to_pandas()
+                t["_r"] = t["Type"].astype(str).str.strip().map(rank)
+                t["_s"] = t["Separation"] if "Separation" in t else 0.0
+                g = t.dropna(subset=["_r"]).sort_values(["_r", "_s"])   # galaxies before groups
+                if len(g):
+                    return str(g.iloc[0]["Object Name"]).strip(), "NED", "ok"
+            break
+        except Exception as e:
+            print(f"    NED attempt {attempt + 1} failed ({type(e).__name__})")
+            time.sleep(5 * (attempt + 1))
+    try:
+        from astroquery.simbad import Simbad
+        t = Simbad.query_region(c, radius=radius_arcsec * u.arcsec)
+        answered = True
+        if t is not None and len(t):
+            t = t.to_pandas()
+            idcol = next((x for x in t.columns if x.lower() == "main_id"), None)
+            otcol = next((x for x in t.columns if x.lower() in ("otype", "otype_s")), None)
+            if otcol is not None:
+                gal = t[t[otcol].astype(str).str.contains("G", regex=False)]
+                t = gal if len(gal) else t
+            if idcol and len(t):
+                return str(t.iloc[0][idcol]).strip(), "SIMBAD", "ok"
+    except Exception as e:
+        print(f"    SIMBAD lookup failed ({type(e).__name__})")
+    return None, None, ("none" if answered else "error")
+
+
+def name_hosts(F, gal):
+    """Readable host names for the candidates' galaxies. Uses (in order): galaxy_names.csv
+    (saved lookups, can be pre-filled), the REGALADE name, a NED/SIMBAD lookup by position for
+    hosts that only have a PGC or coordinate name. Lookups are saved, so each galaxy is
+    looked up once. Shown as e.g. 'PGC2789 = NGC 253'."""
+    import os
+    if F.empty:
+        return F
+    cache = pd.read_csv(NAMES_FILE) if os.path.exists(NAMES_FILE) else \
+        pd.DataFrame(columns=["ra", "dec", "name", "common", "source"])
+    G = gal.set_index("gid")
+    out, new = {}, []
+    for gid in F.host_gid.unique():
+        g = G.loc[gid]
+        base = str(g["name"])
+        hit = cache[(np.hypot((cache.ra - g.ra) * np.cos(np.radians(g.dec)), cache.dec - g.dec) < 0.01)] \
+            if len(cache) else cache
+        hit = hit[hit.source.astype(str) != "not found"]      # old entries that were really errors: retry
+        common = None
+        if len(hit):
+            h = hit.iloc[0]
+            if isinstance(h["name"], str) and h["name"].strip() and base.startswith("J"):
+                base = h["name"].strip()
+            common = h["common"] if isinstance(h["common"], str) and h["common"].strip() else None
+        common = common or COMMON.get(base.replace(" ", ""))
+        if (CFG["name_lookup"] and common is None and not len(hit)
+                and (base.startswith("J") or base.upper().startswith("PGC"))):
+            rad = float(np.clip(0.25 * g.R1, 10, 60))
+            print(f"  looking up host name at RA {g.ra:.4f} Dec {g.dec:.4f} ...")
+            nm, src, status = _lookup_name(g.ra, g.dec, rad)
+            common = nm
+            if status != "error":                 # never save a failed lookup: retry next run
+                new.append(dict(ra=g.ra, dec=g.dec, name=base, common=nm or "",
+                                source=src or "no galaxy found"))
+            import time
+            time.sleep(1.5)                       # be gentle with NED
+        out[gid] = f"{base} = {common}" if common and common.replace(" ", "") != base.replace(" ", "") else base
+    if new:
+        cache = cache[cache.source.astype(str) != "not found"]
+        keys = {(round(n["ra"], 4), round(n["dec"], 4)) for n in new}
+        cache = cache[[(round(a, 4), round(b, 4)) not in keys for a, b in zip(cache.ra, cache.dec)]]
+        cache = pd.concat([cache, pd.DataFrame(new)], ignore_index=True)
+        cache.to_csv(NAMES_FILE, index=False)
+        print(f"  {len(new)} host name(s) looked up and saved to {NAMES_FILE}")
+    F = F.copy()
+    F["host"] = F.host_gid.map(out)
+    return F
+
+
 def write_html(F, det, path="nova_candidates.html", n=300):
     import matplotlib
     matplotlib.use("Agg")
@@ -540,10 +859,10 @@ def write_html(F, det, path="nova_candidates.html", n=300):
           <td><b>{s.host}</b> ({s.host_D:.1f} Mpc)<br>RA {s.ra:.5f} Dec {s.dec:.5f}<br>
           peak {s.peak_mag:.2f} ({s.peak_filt}) &rarr; M = {s.M_peak:.1f}<br>
           t<sub>2</sub> ~ {s.t2_days:.0f} d &middot; fade {s.decline:.1f} mag<br>
-          {s.n_det} det / {s.n_nights} nights &middot; {s.telescopes}<br>
+          {s.n_det} det / {s.n_nights} nights &middot; {s.telescopes}{" &middot; <b style='color:#b45309'>single night</b>" if s.n_nights == 1 else ""}<br>
           quiet before: {quiet} &middot; r/R<sub>ell</sub> = {s.r_ell:.2f}<br>
           {tns}<br>
-          Gaia sep {s.sep_gaia:.1f}" &middot; score {s.score:.2f}<br>
+          Gaia sep {s.sep_gaia:.1f}" &middot; score {s.score:.2f} &middot; host prior {s.get('host_prior', float('nan')):.2f}<br>
           mean RB {s.rb_mean:.2f} &middot; detected in {s.get('det_frac', float('nan')):.0%} of {s.get('det_frac_filt', '')} exposures<br>
           {"<b style='color:red'>in a group of " + str(int(s.n_cand_near)) + " nearby candidates (artefact?)</b><br>" if s.get('n_cand_near', 0) >= CFG['cluster_n'] else ""}
           <a href="{view}" target=_blank>Legacy viewer</a></td>
@@ -570,16 +889,22 @@ def run(regalade=None, project=PROJECT, dry_run=False, with_images=True,
     import os
     raw = f"nova_hunt_detections_raw_D{CFG['dmax_mpc']:g}_floor{CFG['rb_floor']:g}_v3.parquet"
     gal_file = raw.replace(".parquet", "_galaxies.csv")   # galaxy numbering used by that query
-    if os.path.exists(raw) and not dry_run:
+    use_cache = os.path.exists(raw) and os.path.exists(gal_file) and not dry_run
+    if use_cache:
+        # galaxy ids (gid) in the cached detections refer to the list used at query time; that
+        # list must be the same set of galaxies as now, otherwise the cache is stale
+        saved = pd.read_csv(gal_file)
+        key = lambda g: set(zip(g.ra.round(4), g.dec.round(4)))
+        if key(saved) != key(gal):
+            print(f"Galaxy list changed since {raw} was made ({len(saved)} -> {len(gal)} galaxies): re-querying")
+            use_cache = False
+        else:
+            gal = fill_names(saved)
+    elif os.path.exists(raw) and not dry_run:
+        print(f"{raw} has no matching galaxy list ({gal_file}): re-querying")
+    if use_cache:
         print(f"Using cached detections {raw} (delete it to re-query BigQuery)")
         det = pd.read_parquet(raw)
-        # galaxy ids (gid) in the cached detections refer to the list used at query time
-        for f in [gal_file, "nova_hunt_galaxies.csv"]:
-            if os.path.exists(f):
-                gal = pd.read_csv(f)
-                gal["name"] = gal["name"].astype(str)
-                break
-        gal.to_csv(gal_file, index=False)
     else:
         print("Detections query:")
         det = run_query(detections_query(gal), project, dry_run=dry_run)
@@ -587,7 +912,8 @@ def run(regalade=None, project=PROJECT, dry_run=False, with_images=True,
             return None
         det.to_parquet(raw)
         gal.to_csv(gal_file, index=False)
-    gal.to_csv("nova_hunt_galaxies.csv", index=False)
+    tag = f"D{CFG['dmax_mpc']:g}"
+    gal.to_csv(f"nova_hunt_galaxies_{tag}.csv", index=False)
     print(f"{len(det)} detections with CLASS_REAL >= {CFG['rb_floor']}")
 
     det = associate(det, gal)
@@ -603,15 +929,18 @@ def run(regalade=None, project=PROJECT, dry_run=False, with_images=True,
         images = fetch_images(F, project, img_cache)
         F = add_detection_fraction(F, det, images)
         frac_ok = ~(F.det_frac < CFG["det_frac_min"])      # NaN (no image info) is kept
+        frac_ok &= ~((F.n_nights == 1) & ~(F.det_frac >= CFG["single_frac_min"]))  # singles: stricter
         print(f"  det_frac >= {CFG['det_frac_min']:<6}{frac_ok.sum():>8d}")
         F = F[frac_ok]
         F = add_quiet_flag(F, images)
     F = flag_clusters(F)
 
     F = flag_tns(F, tns)
-    F.to_csv("nova_candidates.csv")
-    det.to_csv("nova_hunt_detections.csv", index=False)
-    write_html(F, det)
+    F = name_hosts(F, gal)
+    F.to_csv(f"nova_candidates_{tag}.csv")
+    det.to_csv(f"nova_hunt_detections_{tag}.csv", index=False)
+    write_html(F, det, path=f"nova_candidates_{tag}.html")
+    print(f"outputs: nova_candidates_{tag}.html / .csv")
     return F, det
 
 
@@ -629,8 +958,21 @@ if __name__ == "__main__":
                     help="local TNS public-objects CSV for flagging known transients")
     ap.add_argument("--min-nights", type=int, default=CFG["min_nights"],
                     help="set to 1 to include single-night sources (many more, mostly junk)")
+    ap.add_argument("--no-single-night", action="store_true",
+                    help="drop single-night sources entirely (they are kept only with >=4 detections "
+                         "from 2 telescopes or 2 filters, seen in >=50%% of that night's exposures)")
+    ap.add_argument("--allow-empty-strips", action="store_true",
+                    help="accept REGALADE RA strips that VizieR returns empty (normally an error)")
+    ap.add_argument("--no-name-lookup", action="store_true",
+                    help="do not look up host-galaxy names online (galaxy_names.csv is still used)")
+    ap.add_argument("--rank-by-host", action="store_true",
+                    help="multiply the score by the host prior (old behaviour)")
     ap.add_argument("--no-images", action="store_true", help="skip the quiet-before image query")
     a = ap.parse_args()
     CFG["dmax_mpc"], CFG["rb_min"], CFG["min_nights"] = a.dmax, a.rb, a.min_nights
     CFG["rb_floor"], CFG["det_frac_min"] = a.rb_floor, a.det_frac
+    CFG["score_uses_host"] = a.rank_by_host
+    CFG["single_night"] = not a.no_single_night
+    CFG["allow_empty_strips"] = a.allow_empty_strips
+    CFG["name_lookup"] = not a.no_name_lookup
     run(a.regalade, a.project, a.dry_run, not a.no_images, a.tns)

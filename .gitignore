@@ -1,10 +1,17 @@
 # Data products and cached query results (large, and contain unpublished survey data)
 *.parquet
 *.csv
-!requirements.txt
-nova_candidates.html
+!galaxy_names.csv
+*.html
 *.fits
 *.part*
+lc_data/
+lc_plots/
+
+# Credentials and downloads -- never commit
+api_key*.txt
+*.zip
+*.bak
 
 # Python
 __pycache__/
